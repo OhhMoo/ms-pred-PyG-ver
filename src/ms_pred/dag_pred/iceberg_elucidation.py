@@ -339,7 +339,7 @@ def load_real_spec(
     # denoise spectrum (thresholding)
     if denoise_spectrum:
         real_spec = [(k, common.max_inten_spec(v, max_num_inten=20, inten_thresh=intensity_threshold)) for k, v in real_spec]
-        real_spec = [(k, common.combined_electronic_denoising(v)) for k, v in real_spec]
+        real_spec = [(k, common.electronic_denoising(v)) for k, v in real_spec]
         # real_spec = list(common.denoise_spectra_dict(dict(real_spec)).items())
         # pass
     real_spec = common.process_spec_file(meta, real_spec, merge_specs=False)
@@ -388,7 +388,7 @@ def load_pred_spec(
 
             if denoise_spectrum:
                 spec = [(k, common.max_inten_spec(v, max_num_inten=20, inten_thresh=0.05)) for k, v in spec_dict.items()]
-                spec_dict = dict([(k, common.combined_electronic_denoising(v)) for k, v in spec])
+                spec_dict = dict([(k, common.electronic_denoising(v)) for k, v in spec])
                 # spec_dict = common.denoise_spectra_dict(spec_dict)
 
             if merge_spec:
