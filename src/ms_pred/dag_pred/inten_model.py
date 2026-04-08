@@ -5,7 +5,7 @@ import torch
 import pytorch_lightning as pl
 import torch.nn as nn
 import torch_scatter as ts
-import dgl.nn as dgl_nn
+from torch_geometric.nn import global_mean_pool, GlobalAttention
 import pygmtools as pygm
 import functools
 
@@ -256,9 +256,9 @@ class IntenGNN(pl.LightningModule):
         self.inten_buckets.requires_grad = False
 
         if self.pool_op == "avg":
-            self.pool = dgl_nn.AvgPooling()
+            self.pool = lambda x, batch: global_mean_pool(x, batch)
         elif self.pool_op == "attn":
-            self.pool = dgl_nn.GlobalAttentionPooling(nn.Linear(hidden_size, 1))
+            self.pool = GlobalAttention(nn.Linear(hidden_size, 1))
         else:
             raise NotImplementedError()
 
@@ -491,50 +491,45 @@ class IntenGNN(pl.LightningModule):
             root_embeddings = self.root_module(root_repr)
             raise NotImplementedError()
         elif self.root_encode == "gnn":
-            with root_repr.local_scope():
-                if self.embed_adduct:
-                    embed_adducts_expand = embed_adducts.repeat_interleave(
-                        root_repr.batch_num_nodes(), 0
-                    )
-                    ndata = root_repr.ndata["h"]
-                    ndata = torch.cat([ndata, embed_adducts_expand], -1)
-                    root_repr.ndata["h"] = ndata
+            orig_root_x = root_repr.x.clone()
+            if self.embed_adduct:
+                embed_adducts_expand = embed_adducts[root_repr.batch]
+                ndata = root_repr.x
+                ndata = torch.cat([ndata, embed_adducts_expand], -1)
+                root_repr.x = ndata
 
-                if self.embed_collision:
-                    embed_collision = torch.cat(
-                        (torch.sin(collision_engs.unsqueeze(1) / self.collision_embedder_denominators.unsqueeze(0)),
-                         torch.cos(collision_engs.unsqueeze(1) / self.collision_embedder_denominators.unsqueeze(0))),
-                        dim=1
-                    )
-                    embed_collision = torch.where(  # handle entries without collision energy (== nan)
-                        torch.isnan(embed_collision), self.collision_embed_merged.unsqueeze(0), embed_collision
-                    )
-                    embed_collision_expand = embed_collision.repeat_interleave(
-                        root_repr.batch_num_nodes(), 0
-                    )
-                    ndata = root_repr.ndata["h"]
-                    ndata = torch.cat([ndata, embed_collision_expand], -1)
-                    root_repr.ndata["h"] = ndata
+            if self.embed_collision:
+                embed_collision = torch.cat(
+                    (torch.sin(collision_engs.unsqueeze(1) / self.collision_embedder_denominators.unsqueeze(0)),
+                     torch.cos(collision_engs.unsqueeze(1) / self.collision_embedder_denominators.unsqueeze(0))),
+                    dim=1
+                )
+                embed_collision = torch.where(  # handle entries without collision energy (== nan)
+                    torch.isnan(embed_collision), self.collision_embed_merged.unsqueeze(0), embed_collision
+                )
+                embed_collision_expand = embed_collision[root_repr.batch]
+                ndata = root_repr.x
+                ndata = torch.cat([ndata, embed_collision_expand], -1)
+                root_repr.x = ndata
 
-                if self.embed_instrument:
+            if self.embed_instrument:
 
-                    # TODO: should I account for nan:
-                    # self.instrument_nansub = nn.Parameter(torch.zeros(len(set(common.instrument2onehot_pos.values()))))
-                    # self.instrument_nansub.requires_grad = False
+                # TODO: should I account for nan:
+                # self.instrument_nansub = nn.Parameter(torch.zeros(len(set(common.instrument2onehot_pos.values()))))
+                # self.instrument_nansub.requires_grad = False
 
-                    # embed_instruments = torch.where(torch.isnan(embed_instruments), 
-                    #                                 self.instrument_nansub.unsqueeze(0),
-                    #                                 embed_instruments
-                    # )
-                    embed_instruments_expand = embed_instruments.repeat_interleave(
-                        root_repr.batch_num_nodes(), 0
-                    )
+                # embed_instruments = torch.where(torch.isnan(embed_instruments),
+                #                                 self.instrument_nansub.unsqueeze(0),
+                #                                 embed_instruments
+                # )
+                embed_instruments_expand = embed_instruments[root_repr.batch]
 
-                    ndata = root_repr.ndata["h"]
-                    ndata = torch.cat([ndata, embed_instruments_expand], -1)
-                    root_repr.ndata["h"] = ndata
-                root_embeddings = self.root_module(root_repr)
-                root_embeddings = self.pool(root_repr, root_embeddings)
+                ndata = root_repr.x
+                ndata = torch.cat([ndata, embed_instruments_expand], -1)
+                root_repr.x = ndata
+            root_embeddings = self.root_module(root_repr)
+            root_embeddings = self.pool(root_embeddings, root_repr.batch)
+            root_repr.x = orig_root_x
         else:
             pass
 
@@ -543,9 +538,9 @@ class IntenGNN(pl.LightningModule):
         ext_root = root_embeddings[ind_maps]
         # Extend the root further to cover each individual atom
         ext_root_atoms = torch.repeat_interleave(
-            ext_root, graphs.batch_num_nodes(), dim=0
+            ext_root, torch.bincount(graphs.batch), dim=0
         )
-        concat_list = [graphs.ndata["h"]]
+        concat_list = [graphs.x]
 
         if self.inject_early:
             concat_list.append(ext_root_atoms)
@@ -553,31 +548,32 @@ class IntenGNN(pl.LightningModule):
         if self.embed_adduct:
             adducts_mapped = embed_adducts[ind_maps]
             adducts_exp = torch.repeat_interleave(
-                adducts_mapped, graphs.batch_num_nodes(), dim=0
+                adducts_mapped, torch.bincount(graphs.batch), dim=0
             )
             concat_list.append(adducts_exp)
 
         if self.embed_collision:
             collision_mapped = embed_collision[ind_maps]
             collision_exp = torch.repeat_interleave(
-                collision_mapped, graphs.batch_num_nodes(), dim=0
+                collision_mapped, torch.bincount(graphs.batch), dim=0
             )
             concat_list.append(collision_exp)
 
         if self.embed_instrument:
             instruments_mapped = embed_instruments[ind_maps]
             instruments_exp = torch.repeat_interleave(
-                instruments_mapped, graphs.batch_num_nodes(), dim=0
+                instruments_mapped, torch.bincount(graphs.batch), dim=0
             )
             concat_list.append(instruments_exp)
 
-        with graphs.local_scope():
-            graphs.ndata["h"] = torch.cat(concat_list, -1).float()
+        original_x = graphs.x
+        graphs.x = torch.cat(concat_list, -1).float()
 
-            frag_embeddings = self.gnn(graphs)
+        frag_embeddings = self.gnn(graphs)
 
-            # Average embed the full root molecules and fragments
-            avg_frags = self.pool(graphs, frag_embeddings)
+        # Average embed the full root molecules and fragments
+        avg_frags = self.pool(frag_embeddings, graphs.batch)
+        graphs.x = original_x
 
         # expand broken and map it to each fragment
         broken_arange = torch.arange(broken.shape[-1]).to(device)

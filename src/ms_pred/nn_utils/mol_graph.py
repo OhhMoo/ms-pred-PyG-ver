@@ -7,7 +7,7 @@ and bonds. Inspired by the dgllife library.
 from rdkit import Chem
 import numpy as np
 import torch
-import dgl
+from torch_geometric.data import Data
 import ms_pred.nn_utils.nn_utils as nn_utils
 
 atom_feat_registry = {}
@@ -26,7 +26,7 @@ def register_atom_feat(cls):
     return cls
 
 
-class MolDGLGraph:
+class MolGraph:
     def __init__(
         self,
         atom_feats: list = [
@@ -138,7 +138,7 @@ class MolDGLGraph:
             bigraph (bool): If true, double all edges.
 
         Return:
-            dgl graph object
+            torch_geometric.data.Data object
         """
         mol_graph = self.get_mol_graph(mol, bigraph=bigraph)
 
@@ -146,20 +146,26 @@ class MolDGLGraph:
         bond_feats = torch.from_numpy(mol_graph["bond_feats"]).float()
         atom_feats = torch.from_numpy(mol_graph["atom_feats"]).float()
 
-        g = dgl.graph(
-            data=(bond_inds[:, 0], bond_inds[:, 1]), num_nodes=atom_feats.shape[0]
-        )
-        g.ndata["h"] = atom_feats
-        g.edata["e"] = bond_feats
+        edge_index = bond_inds.t().contiguous()  # (2, E)
 
         if self.pe_embed_k > 0:
             pe_embeds = nn_utils.random_walk_pe(
-                g,
+                edge_index,
+                num_nodes=atom_feats.shape[0],
                 k=self.pe_embed_k,
             )
-            g.ndata["h"] = torch.cat((g.ndata["h"], pe_embeds), -1)
+            atom_feats = torch.cat((atom_feats, pe_embeds), -1)
 
-        return g
+        data = Data(
+            x=atom_feats,
+            edge_index=edge_index,
+            edge_attr=bond_feats,
+        )
+        return data
+
+
+# Backward compatibility alias
+MolDGLGraph = MolGraph
 
 
 class FeatBase:

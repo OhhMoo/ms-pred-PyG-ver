@@ -7,7 +7,7 @@ from tqdm import tqdm
 import torch
 from rdkit import Chem
 from torch.utils.data.dataset import Dataset
-import dgl
+from torch_geometric.data import Batch
 import ast
 import copy
 
@@ -267,7 +267,7 @@ class BinnedDataset(Dataset):
         # Now pad everything else to the max channel dim
         spectra_tensors = torch.stack([torch.tensor(spectra) for spectra in spec_ars])
 
-        batched_graph = dgl.batch(graphs)
+        batched_graph = Batch.from_data_list(graphs)
         # frag_batch.set_n_initializer(dgl.init.zero_initializer)
         # frag_batch.set_e_initializer(dgl.init.zero_initializer)
 
@@ -365,7 +365,7 @@ class MolDataset(Dataset):
         nces = torch.FloatTensor(nces)
 
         full_forms = torch.FloatTensor([j["root_form"] for j in input_list])
-        batched_graph = dgl.batch(graphs)
+        batched_graph = Batch.from_data_list(graphs)
         return_dict = {
             "graphs": batched_graph,
             "spec_names": spec_names,

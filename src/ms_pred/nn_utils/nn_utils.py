@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_scatter
-import dgl
+from torch_geometric.data import Data, Batch
 from packaging.version import Version
 
 if Version(torch.__version__) > Version('2.0.0'):
@@ -21,8 +21,7 @@ else:
         raise ModuleNotFoundError("Please either install torch_sparse or upgrade to a PyTorch version that supports "
                                   "sparse-sparse matrix multiply")
 
-from dgl.backend import pytorch as dgl_F
-import ms_pred.nn_utils.dgl_modules as dgl_mods
+import ms_pred.nn_utils.pyg_modules as pyg_mods
 
 
 def get_clones(module, N):
@@ -122,29 +121,30 @@ class MoleculeGNN(nn.Module):
             n_layers=set_transform_layers,
         )
 
-    def forward(self, g):
-        """encode batch of molecule graph"""
-        with g.local_scope():
-            # Set initial hidden
-            ndata = g.ndata[self.node_feat_symbol]
-            edata = g.edata["e"]
-            h_init = self.input_project(ndata)
-            g.ndata.update({"_h": h_init})
-            g.edata.update({"_e": edata})
+    def forward(self, data):
+        """Encode batch of molecule graphs.
 
-            if self.mpnn_type == "GGNN":
-                # Get graph output
-                output = self.gnn(g, "_h", "_e")
-            elif self.mpnn_type == "PNA":
-                # Get graph output
-                output = self.gnn(g, "_h", "_e")
-            elif self.mpnn_type == "GINE":
-                # Get graph output
-                output = self.gnn(g, "_h", "_e")
-            else:
-                raise NotImplementedError()
+        Args:
+            data: PyG Data/Batch object with .x, .edge_index, .edge_attr, .batch
+        """
+        ndata = data.x
+        edata = data.edge_attr
+        edge_index = data.edge_index
+        batch = data.batch if hasattr(data, 'batch') and data.batch is not None else torch.zeros(ndata.shape[0], dtype=torch.long, device=ndata.device)
 
-        output = self.set_transformer(g, output)
+        h_init = self.input_project(ndata)
+
+        if self.mpnn_type == "GGNN":
+            edge_type = data.edge_type if hasattr(data, 'edge_type') and data.edge_type is not None else edata.argmax(1)
+            output = self.gnn(h_init, edge_index, edata, edge_type=edge_type)
+        elif self.mpnn_type == "PNA":
+            output = self.gnn(h_init, edge_index, edata, batch=batch)
+        elif self.mpnn_type == "GINE":
+            output = self.gnn(h_init, edge_index, edata)
+        else:
+            raise NotImplementedError()
+
+        output = self.set_transformer(batch, output)
         return output
 
 
@@ -160,10 +160,8 @@ class GINE(nn.Module):
         """GINE.
 
         Args:
-            input_size (int): Size of edge features into the graph
             hidden_size (int): Hidden size
             edge_feats (int): Number of edge feats. Must be onehot!
-            node_feats (int): Num of node feats (default 74)
             num_step_message_passing (int): Number of message passing steps
             dropout
         """
@@ -178,31 +176,28 @@ class GINE(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_size, hidden_size),
             )
-            temp_layer = dgl_mods.GINEConv(apply_func=apply_fn, init_eps=0)
+            temp_layer = pyg_mods.GINEConv(apply_func=apply_fn, init_eps=0)
             self.layers.append(temp_layer)
 
         self.layers = nn.ModuleList(self.layers)
         self.bnorms = get_clones(nn.BatchNorm1d(hidden_size), num_step_message_passing)
         self.dropouts = get_clones(nn.Dropout(dropout), num_step_message_passing)
 
-    def forward(self, graph, nfeat_name="_h", efeat_name="_e"):
+    def forward(self, node_feat, edge_index, edge_feat):
         """forward.
 
         Args:
-            graph (dgl graph): Graph object
-            nfeat_name (str): Name of node feat data
-            efeat_name (str): Name of e feat
+            node_feat: Node features (N, D)
+            edge_index: Edge indices (2, E)
+            edge_feat: Edge features (E, D_e)
 
         Return:
-            h: Hidden state at each node
-
-
+            h: Hidden state at each node (N, D)
         """
-        node_feat, edge_feat = graph.ndata[nfeat_name], graph.edata[efeat_name]
         edge_feat = self.edge_transform(edge_feat)
 
         for dropout, layer, norm in zip(self.dropouts, self.layers, self.bnorms):
-            layer_out = layer(graph, node_feat, edge_feat)
+            layer_out = layer(node_feat, edge_index, edge_feat)
             node_feat = F.relu(dropout(norm(layer_out))) + node_feat
 
         return node_feat
@@ -214,42 +209,38 @@ class GGNN(nn.Module):
     ):
         """GGNN.
 
-        Define a gated graph neural network
-
-        This is very similar to the NNConv models.
+        Define a gated graph neural network.
 
         Args:
-            input_size (int): Size of edge features into the graph
             hidden_size (int): Hidden size
             edge_feats (int): Number of edge feats. Must be onehot!
-            node_feats (int): Num of node feats (default 74)
             num_step_message_passing (int): Number of message passing steps
         """
         super().__init__()
-        self.model = dgl_mods.GatedGraphConv(
+        self.model = pyg_mods.GatedGraphConv(
             in_feats=hidden_size,
             out_feats=hidden_size,
             n_steps=num_step_message_passing,
             n_etypes=edge_feats,
         )
 
-    def forward(self, graph, nfeat_name="_h", efeat_name="_e"):
+    def forward(self, node_feat, edge_index, edge_feat, edge_type=None):
         """forward.
 
         Args:
-            graph (dgl graph): Graph object
-            nfeat_name (str): Name of node feat data
-            efeat_name (str): Name of e feat
+            node_feat: Node features (N, D)
+            edge_index: Edge indices (2, E)
+            edge_feat: Edge features (E, D_e) - used for edge type if edge_type is None
+            edge_type: Edge type indices (E,), optional
 
         Return:
-            h: Hidden state at each node
-
+            h: Hidden state at each node (N, D)
         """
-        if "e_ind" in graph.edata:
-            etypes = graph.edata["e_ind"]
+        if edge_type is None:
+            etypes = edge_feat.argmax(1)
         else:
-            etypes = graph.edata[efeat_name].argmax(1)
-        return self.model(graph, graph.ndata[nfeat_name], etypes=etypes)
+            etypes = edge_type
+        return self.model(node_feat, edge_index, etypes=etypes)
 
 
 class PNA(nn.Module):
@@ -263,17 +254,15 @@ class PNA(nn.Module):
     ):
         """PNA.
 
-        Define a PNA network
+        Define a PNA network.
 
         Args:
-            input_size (int): Size of edge features into the graph
             hidden_size (int): Hidden size
-            edge_feats (int): Number of edge feats. Must be onehot!
-            node_feats (int): Num of node feats (default 74)
+            edge_feats (int): Number of edge feats
             num_step_message_passing (int): Number of message passing steps
         """
         super().__init__()
-        self.layer = dgl_mods.PNAConv(
+        self.layer = pyg_mods.PNAConv(
             in_size=hidden_size,
             out_size=hidden_size,
             aggregators=["mean", "max", "min", "std", "var", "sum"],
@@ -285,21 +274,20 @@ class PNA(nn.Module):
         self.layers = get_clones(self.layer, num_step_message_passing)
         self.bnorms = get_clones(nn.BatchNorm1d(hidden_size), num_step_message_passing)
 
-    def forward(self, graph, nfeat_name="_h", efeat_name="_e"):
+    def forward(self, node_feat, edge_index, edge_feat, batch=None):
         """forward.
 
         Args:
-            graph (dgl graph): Graph object
-            nfeat_name (str): Name of node feat data
-            efeat_name (str): Name of e feat
+            node_feat: Node features (N, D)
+            edge_index: Edge indices (2, E)
+            edge_feat: Edge features (E, D_e)
+            batch: Batch assignment (N,), optional
 
         Return:
-            h: Hidden state at each node
-
+            h: Hidden state at each node (N, D)
         """
-        node_feat, edge_feat = graph.ndata[nfeat_name], graph.edata[efeat_name]
         for layer, norm in zip(self.layers, self.bnorms):
-            node_feat = F.relu(norm(layer(graph, node_feat, edge_feat))) + node_feat
+            node_feat = F.relu(norm(layer(node_feat, edge_index, edge_feat, batch))) + node_feat
 
         return node_feat
 
@@ -373,10 +361,6 @@ class MLPBlocks(nn.Module):
         return output
 
 
-# DGL Models
-# https://docs.dgl.ai/en/0.6.x/_modules/dgl/nn/pytorch/glob.html#SetTransformerDecoder
-
-
 class MultiHeadAttention(nn.Module):
     r"""Multi-Head Attention block, used in Transformer, Set Transformer and so on.
 
@@ -394,10 +378,6 @@ class MultiHeadAttention(nn.Module):
         The dropout rate of each sublayer.
     dropouta : float
         The dropout rate of attention heads.
-
-    Notes
-    -----
-    This module was used in SetTransformer layer.
     """
 
     def __init__(self, d_model, num_heads, d_head, d_ff, dropouth=0.0, dropouta=0.0):
@@ -442,9 +422,9 @@ class MultiHeadAttention(nn.Module):
         values = self.proj_v(mem).view(-1, self.num_heads, self.d_head)
 
         # padding to (B, max_len_x/mem, num_heads, d_head)
-        queries = dgl_F.pad_packed_tensor(queries, lengths_x, 0)
-        keys = dgl_F.pad_packed_tensor(keys, lengths_mem, 0)
-        values = dgl_F.pad_packed_tensor(values, lengths_mem, 0)
+        queries = pad_packed_tensor(queries, lengths_x, 0)
+        keys = pad_packed_tensor(keys, lengths_mem, 0)
+        values = pad_packed_tensor(values, lengths_mem, 0)
 
         # attention score with shape (B, num_heads, max_len_x, max_len_mem)
         e = torch.einsum("bxhd,byhd->bhxy", queries, keys)
@@ -468,7 +448,7 @@ class MultiHeadAttention(nn.Module):
             out.contiguous().view(batch_size, max_len_x, self.num_heads * self.d_head)
         )
         # pack tensor
-        out = dgl_F.pack_padded_tensor(out, lengths_x)
+        out = pack_padded_tensor(out, lengths_x)
         return out
 
     def forward(self, x, mem, lengths_x, lengths_mem):
@@ -495,11 +475,6 @@ class MultiHeadAttention(nn.Module):
         # inter norm
         x = x + self.ffn(self.norm_inter(x))
 
-        ## intra norm
-        # x = self.norm_in(x + out)
-
-        ## inter norm
-        # x = self.norm_inter(x + self.ffn(x))
         return x
 
 
@@ -520,10 +495,6 @@ class SetAttentionBlock(nn.Module):
         The dropout rate of each sublayer.
     dropouta : float
         The dropout rate of attention heads.
-
-    Notes
-    -----
-    This module was used in SetTransformer layer.
     """
 
     def __init__(self, d_model, num_heads, d_head, d_ff, dropouth=0.0, dropouta=0.0):
@@ -548,11 +519,7 @@ class SetAttentionBlock(nn.Module):
 
 class SetTransformerEncoder(nn.Module):
     r"""
-
-    Description
-    -----------
-    The Encoder module in `Set Transformer: A Framework for Attention-based
-    Permutation-Invariant Neural Networks <https://arxiv.org/pdf/1810.00825.pdf>`__.
+    The Encoder module in Set Transformer.
 
     Parameters
     ----------
@@ -563,77 +530,17 @@ class SetTransformerEncoder(nn.Module):
     d_head : int
         The hidden size of each head.
     d_ff : int
-        The kernel size in FFN (Positionwise Feed-Forward Network) layer.
+        The kernel size in FFN layer.
     n_layers : int
         The number of layers.
     block_type : str
-        Building block type: 'sab' (Set Attention Block) or 'isab' (Induced
-        Set Attention Block).
+        Building block type: 'sab' or 'isab'.
     m : int or None
-        The number of induced vectors in ISAB Block. Set to None if block type
-        is 'sab'.
+        The number of induced vectors in ISAB Block.
     dropouth : float
         The dropout rate of each sublayer.
     dropouta : float
         The dropout rate of attention heads.
-
-    Examples
-    --------
-    >>> import dgl
-    >>> import torch as th
-    >>> from dgl.nn import SetTransformerEncoder
-    >>>
-    >>> g1 = dgl.rand_graph(3, 4)  # g1 is a random graph with 3 nodes and 4 edges
-    >>> g1_node_feats = torch.rand(3, 5)  # feature size is 5
-    >>> g1_node_feats
-    tensor([[0.8948, 0.0699, 0.9137, 0.7567, 0.3637],
-            [0.8137, 0.8938, 0.8377, 0.4249, 0.6118],
-            [0.5197, 0.9030, 0.6825, 0.5725, 0.4755]])
-    >>>
-    >>> g2 = dgl.rand_graph(4, 6)  # g2 is a random graph with 4 nodes and 6 edges
-    >>> g2_node_feats = torch.rand(4, 5)  # feature size is 5
-    >>> g2_node_feats
-    tensor([[0.2053, 0.2426, 0.4111, 0.9028, 0.5658],
-            [0.5278, 0.6365, 0.9990, 0.2351, 0.8945],
-            [0.3134, 0.0580, 0.4349, 0.7949, 0.3891],
-            [0.0142, 0.2709, 0.3330, 0.8521, 0.6925]])
-    >>>
-    >>> set_trans_enc = SetTransformerEncoder(5, 4, 4, 20)  # create a settrans encoder.
-
-    Case 1: Input a single graph
-
-    >>> set_trans_enc(g1, g1_node_feats)
-    tensor([[ 0.1262, -1.9081,  0.7287,  0.1678,  0.8854],
-            [-0.0634, -1.1996,  0.6955, -0.9230,  1.4904],
-            [-0.9972, -0.7924,  0.6907, -0.5221,  1.6211]],
-           grad_fn=<NativeLayerNormBackward>)
-
-    Case 2: Input a batch of graphs
-
-    Build a batch of DGL graphs and concatenate all graphs' node features into one tensor.
-
-    >>> batch_g = dgl.batch([g1, g2])
-    >>> batch_f = torch.cat([g1_node_feats, g2_node_feats])
-    >>>
-    >>> set_trans_enc(batch_g, batch_f)
-    tensor([[ 0.1262, -1.9081,  0.7287,  0.1678,  0.8854],
-            [-0.0634, -1.1996,  0.6955, -0.9230,  1.4904],
-            [-0.9972, -0.7924,  0.6907, -0.5221,  1.6211],
-            [-0.7973, -1.3203,  0.0634,  0.5237,  1.5306],
-            [-0.4497, -1.0920,  0.8470, -0.8030,  1.4977],
-            [-0.4940, -1.6045,  0.2363,  0.4885,  1.3737],
-            [-0.9840, -1.0913, -0.0099,  0.4653,  1.6199]],
-           grad_fn=<NativeLayerNormBackward>)
-
-    See Also
-    --------
-    SetTransformerDecoder
-
-    Notes
-    -----
-    SetTransformerEncoder is not a readout layer, the tensor it returned is nodewise
-    representation instead out graphwise representation, and the SetTransformerDecoder
-    would return a graph readout tensor.
     """
 
     def __init__(
@@ -671,33 +578,30 @@ class SetTransformerEncoder(nn.Module):
                     )
                 )
             elif block_type == "isab":
-                # layers.append(
-                #    InducedSetAttentionBlock(m, d_model, n_heads, d_head, d_ff,
-                #                             dropouth=dropouth, dropouta=dropouta))
                 raise NotImplementedError()
             else:
                 raise KeyError("Unrecognized block type {}: we only support sab/isab")
 
         self.layers = nn.ModuleList(layers)
 
-    def forward(self, graph, feat):
+    def forward(self, batch_tensor, feat):
         """
         Compute the Encoder part of Set Transformer.
 
         Parameters
         ----------
-        graph : DGLGraph
-            The input graph.
+        batch_tensor : torch.Tensor
+            Batch assignment tensor of shape :math:`(N,)` mapping each node
+            to its graph index. Used to compute per-graph node counts.
         feat : torch.Tensor
-            The input feature with shape :math:`(N, D)`, where :math:`N` is the
-            number of nodes in the graph.
+            The input feature with shape :math:`(N, D)`.
 
         Returns
         -------
         torch.Tensor
             The output feature with shape :math:`(N, D)`.
         """
-        lengths = graph.batch_num_nodes()
+        lengths = torch.bincount(batch_tensor)
         for layer in self.layers:
             feat = layer(feat, lengths)
         return feat
@@ -741,7 +645,7 @@ def pad_packed_tensor(input, lengths, value):
     old_shape = input.shape
     device = input.device
     if not isinstance(lengths, torch.Tensor):
-        lengths = lengths.clone().detach().long().to(device)
+        lengths = torch.tensor(lengths, dtype=torch.long, device=device)
     else:
         lengths = lengths.to(device)
     max_len = (lengths.max()).item()
@@ -770,10 +674,9 @@ def pack_padded_tensor(input, lengths):
     """pack_padded_tensor"""
     device = input.device
     if not isinstance(lengths, torch.Tensor):
-        lengths = lengths.clone().detach().long().to(device)
+        lengths = torch.tensor(lengths, dtype=torch.long, device=device)
     else:
         lengths = lengths.to(device)
-    max_len = (lengths.max()).item()
 
     batch_size = len(lengths)
     packed_tensors = []
@@ -781,10 +684,10 @@ def pack_padded_tensor(input, lengths):
         packed_tensors.append(input[i, :lengths[i].item(), :])
     packed_tensors = torch.cat(packed_tensors)
     return packed_tensors
-    
 
 
-def random_walk_pe(g, k, eweight_name=None):
+
+def random_walk_pe(edge_index, num_nodes, k, edge_weight=None):
     """Random Walk Positional Encoding, as introduced in
     `Graph Neural Networks with Learnable Structural and Positional Representations
     <https://arxiv.org/abs/2110.07875>`__
@@ -794,39 +697,31 @@ def random_walk_pe(g, k, eweight_name=None):
 
     Parameters
     ----------
-    g : DGLGraph
-        The input graph. Must be homogeneous.
+    edge_index : torch.Tensor
+        Edge indices of shape :math:`(2, E)`.
+    num_nodes : int
+        Number of nodes in the graph.
     k : int
-        The number of random walk steps. The paper found the best value to be 16 and 20
-        for two experiments.
-    eweight_name : str, optional
-        The name to retrieve the edge weights. Default: None, not using the edge weights.
+        The number of random walk steps.
+    edge_weight : torch.Tensor, optional
+        Edge weights of shape :math:`(E,)`. Default: None, not using edge weights.
 
     Returns
     -------
     Tensor
-        The random walk positional encodings of shape :math:`(N, k)`, where :math:`N` is the
-        number of nodes in the input graph.
-
-    Example
-    -------
-    >>> import dgl
-    >>> g = dgl.graph(([0,1,1], [1,1,0]))
-    >>> dgl.random_walk_pe(g, 2)
-    tensor([[0.0000, 0.5000],
-            [0.5000, 0.7500]])
+        The random walk positional encodings of shape :math:`(N, k)`.
     """
-    device = g.device
-    N = g.num_nodes()  # number of nodes
-    M = g.num_edges()  # number of edges
+    device = edge_index.device
+    N = num_nodes
+    E = edge_index.shape[1]
 
-    row, col = g.edges()
+    row, col = edge_index[0], edge_index[1]
 
-    if eweight_name is None:
-        value = torch.ones(M, device=device)
+    if edge_weight is None:
+        value = torch.ones(E, device=device)
     else:
-        value = g.edata[eweight_name].squeeze().to(device)
-    # value_norm = torch_scatter.scatter(value, col, dim_size=N, reduce='sum').clamp(min=1)[col]
+        value = edge_weight.float().squeeze().to(device)
+
     value_norm = torch_scatter.scatter(value, row, dim_size=N, reduce='sum')[row] + 1e-30
     value = value / value_norm
 
@@ -863,13 +758,28 @@ def random_walk_pe(g, k, eweight_name=None):
     return pe
 
 
-def split_dgl_batch(batch: dgl.DGLGraph, max_dgl_edges, frag_hashes, rev_idx, frag_form_vecs):
-    if batch.num_edges() > max_dgl_edges and batch.batch_size > 1:
-        split = batch.batch_size // 2
-        list_of_graphs = dgl.unbatch(batch)
-        new_batch1 = split_dgl_batch(dgl.batch(list_of_graphs[:split]), max_dgl_edges,
+def split_batch(batch, max_edges, frag_hashes, rev_idx, frag_form_vecs):
+    """Split a PyG Batch if it exceeds max_edges, recursively.
+
+    Parameters
+    ----------
+    batch : torch_geometric.data.Batch
+        The batched graph.
+    max_edges : int
+        Maximum number of edges before splitting.
+    frag_hashes : list
+        Fragment hashes corresponding to each graph.
+    rev_idx : list
+        Reverse indices corresponding to each graph.
+    frag_form_vecs : torch.Tensor
+        Formula vectors corresponding to each graph.
+    """
+    if batch.num_edges > max_edges and batch.num_graphs > 1:
+        split = batch.num_graphs // 2
+        list_of_graphs = batch.to_data_list()
+        new_batch1 = split_batch(Batch.from_data_list(list_of_graphs[:split]), max_edges,
                                      frag_hashes[:split], rev_idx[:split], frag_form_vecs[:split])
-        new_batch2 = split_dgl_batch(dgl.batch(list_of_graphs[split:]), max_dgl_edges,
+        new_batch2 = split_batch(Batch.from_data_list(list_of_graphs[split:]), max_edges,
                                      frag_hashes[split:], rev_idx[split:], frag_form_vecs[split:])
         return new_batch1 + new_batch2
     else:

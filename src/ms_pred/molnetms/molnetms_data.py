@@ -5,7 +5,6 @@ import numpy as np
 import torch
 from rdkit import Chem
 from torch.utils.data.dataset import Dataset
-import dgl
 
 import ms_pred.common as common
 

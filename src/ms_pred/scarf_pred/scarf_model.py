@@ -6,13 +6,13 @@ import pytorch_lightning as pl
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_scatter as ts
-import dgl.nn as dgl_nn
+from torch_geometric.nn import global_mean_pool, GlobalAttention
 import numpy as np
 import einops
 
 from rdkit import Chem
 
-import dgl
+from torch_geometric.data import Data, Batch
 
 import ms_pred.common as common
 import ms_pred.nn_utils as nn_utils
@@ -156,9 +156,9 @@ class ScarfNet(pl.LightningModule):
                 dropout=dropout,
             )
             if self.pool_op == "avg":
-                self.pool = dgl_nn.AvgPooling()
+                self.pool = lambda x, batch: global_mean_pool(x, batch)
             elif self.pool_op == "attn":
-                self.pool = dgl_nn.GlobalAttentionPooling(nn.Linear(hidden_size, 1))
+                self.pool = GlobalAttention(nn.Linear(hidden_size, 1))
             else:
                 raise NotImplementedError()
         elif self.root_embedder == "fp":
@@ -270,7 +270,7 @@ class ScarfNet(pl.LightningModule):
 
     def forward(
         self,
-        graphs: dgl.graph,
+        graphs,
         full_formula: torch.FloatTensor,
         options: torch.FloatTensor,
         diffs: torch.FloatTensor,
@@ -293,7 +293,7 @@ class ScarfNet(pl.LightningModule):
 
 
         Args:
-            graphs (dgl.Graph): graphs with a batch size equal to F
+            graphs: graphs with a batch size equal to F
             full_formula (torch.FloatTensor): full_formula  [F, e]
             options (torch.FloatTensor): options  [b, p, e]
             diffs (torch.FloatTensor): diffs [b, p, e]
@@ -347,19 +347,16 @@ class ScarfNet(pl.LightningModule):
         # [Mols x hidden]
         if self.root_embedder == "gnn":
 
-            with graphs.local_scope():
-                if self.embed_adduct:
-                    embed_adducts = self.adduct_embedder[adducts.long()]
-                    ndata = graphs.ndata["h"]
-                    embed_adducts_expand = embed_adducts.repeat_interleave(
-                        graphs.batch_num_nodes(), 0
-                    )
-                    ndata_new = torch.cat([ndata, embed_adducts_expand], -1)
+            original_x = graphs.x
+            if self.embed_adduct:
+                embed_adducts = self.adduct_embedder[adducts.long()]
+                embed_adducts_expand = embed_adducts[graphs.batch]
+                ndata_new = torch.cat([graphs.x, embed_adducts_expand], -1)
+                graphs.x = ndata_new
 
-                    graphs.ndata["h"] = ndata_new
-
-                mol_outputs = self.gnn(graphs)
-                mol_embeds = self.pool(graphs, mol_outputs)
+            mol_outputs = self.gnn(graphs)
+            mol_embeds = self.pool(mol_outputs, graphs.batch)
+            graphs.x = original_x
         elif self.root_embedder == "fp":
             mol_embeds = self.root_embed_module(graphs)
         elif self.root_embedder == "graphormer":
@@ -411,7 +408,7 @@ class ScarfNet(pl.LightningModule):
             #  B x L x H
             pad_token = -9999
             atom_embeds = nn_utils.pad_packed_tensor(
-                mol_outputs, graphs.batch_num_nodes(), pad_token
+                mol_outputs, torch.bincount(graphs.batch), pad_token
             )
             # B x L x H
             embed_mask = atom_embeds == pad_token
@@ -854,9 +851,9 @@ class ScarfIntenNet(pl.LightningModule):
                 dropout=dropout,
             )
             if self.pool_op == "avg":
-                self.pool = dgl_nn.AvgPooling()
+                self.pool = lambda x, batch: global_mean_pool(x, batch)
             elif self.pool_op == "attn":
-                self.pool = dgl_nn.GlobalAttentionPooling(nn.Linear(hidden_size, 1))
+                self.pool = GlobalAttention(nn.Linear(hidden_size, 1))
             else:
                 raise NotImplementedError()
 
@@ -966,7 +963,7 @@ class ScarfIntenNet(pl.LightningModule):
 
     def _forward_no_bin(
         self,
-        graphs: dgl.graph,
+        graphs,
         formulae: torch.FloatTensor,
         diffs: torch.FloatTensor,
         num_forms: torch.LongTensor,
@@ -977,7 +974,7 @@ class ScarfIntenNet(pl.LightningModule):
         Predict outputs without going all the way to bins
 
         Args:
-            graphs (dgl.graph): graphs
+            graphs: graphs
             formulae (torch.FloatTensor): formulae
             diffs (torch.FloatTensor): diffs
             num_forms (torch.LongTensor): num_forms
@@ -991,17 +988,15 @@ class ScarfIntenNet(pl.LightningModule):
 
         # [Mols x hidden]
         if self.root_embedder == "gnn":
-            with graphs.local_scope():
-                if self.embed_adduct:
-                    embed_adducts = self.adduct_embedder[adducts.long()]
-                    ndata = graphs.ndata["h"]
-                    embed_adducts_expand = embed_adducts.repeat_interleave(
-                        graphs.batch_num_nodes(), 0
-                    )
-                    ndata = torch.cat([ndata, embed_adducts_expand], -1)
-                    graphs.ndata["h"] = ndata
-                mol_outputs = self.gnn(graphs)
-                mol_embeds = self.pool(graphs, mol_outputs)
+            original_x = graphs.x
+            if self.embed_adduct:
+                embed_adducts = self.adduct_embedder[adducts.long()]
+                embed_adducts_expand = embed_adducts[graphs.batch]
+                ndata = torch.cat([graphs.x, embed_adducts_expand], -1)
+                graphs.x = ndata
+            mol_outputs = self.gnn(graphs)
+            mol_embeds = self.pool(mol_outputs, graphs.batch)
+            graphs.x = original_x
         elif self.root_embedder == "fp":
             mol_embeds = self.root_embed_module(graphs)
             raise NotImplementedError()
@@ -1034,7 +1029,7 @@ class ScarfIntenNet(pl.LightningModule):
             #  B x L x H
             pad_token = -9999
             atom_embeds = nn_utils.pad_packed_tensor(
-                mol_outputs, graphs.batch_num_nodes(), pad_token
+                mol_outputs, torch.bincount(graphs.batch), pad_token
             )
             # B x L x H
             embed_mask = atom_embeds == pad_token
@@ -1123,7 +1118,7 @@ class ScarfIntenNet(pl.LightningModule):
 
     def forward(
         self,
-        graphs: dgl.graph,
+        graphs,
         formulae: torch.FloatTensor,
         diffs: torch.FloatTensor,
         num_forms: torch.LongTensor,
@@ -1133,7 +1128,7 @@ class ScarfIntenNet(pl.LightningModule):
         """forward.
 
         Args:
-            graphs (dgl.graph): graphs
+            graphs: graphs
             formulae (torch.FloatTensor): formulae
             diffs (torch.FloatTensor): diffs
             num_forms (torch.LongTensor): num_forms
@@ -1148,7 +1143,7 @@ class ScarfIntenNet(pl.LightningModule):
 
     def forward_unbinned(
         self,
-        graphs: dgl.graph,
+        graphs,
         formulae: torch.FloatTensor,
         diffs: torch.FloatTensor,
         num_forms: torch.LongTensor,
@@ -1173,7 +1168,7 @@ class ScarfIntenNet(pl.LightningModule):
 
     def forward_binned(
         self,
-        graphs: dgl.graph,
+        graphs,
         formulae: torch.FloatTensor,
         diffs: torch.FloatTensor,
         num_forms: torch.LongTensor,

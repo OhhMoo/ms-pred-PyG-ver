@@ -17,8 +17,8 @@ from tqdm import tqdm
 from rdkit import Chem
 
 import torch
-import dgl
 from torch.utils.data.dataset import Dataset
+from torch_geometric.data import Data, Batch
 
 import ms_pred.common as common
 import ms_pred.nn_utils as nn_utils
@@ -208,7 +208,7 @@ class TreeProcessor:
             inten_frag_ids.append(k)
 
             # For gen model only!!
-            targ_vec = np.zeros(graph.num_nodes())
+            targ_vec = np.zeros(graph.num_nodes)
             for j in old_to_new[binary_targs]:
                 targ_vec[j] = 1
 
@@ -281,7 +281,7 @@ class TreeProcessor:
             for graph in dgl_inputs:
                 self.add_pe_embed(graph)
 
-            if isinstance(root_repr, dgl.DGLGraph):
+            if isinstance(root_repr, Data):
                 self.add_pe_embed(root_repr)
 
         if include_targets and self.binned_targs:
@@ -296,9 +296,12 @@ class TreeProcessor:
 
     def add_pe_embed(self, graph):
         pe_embeds = nn_utils.random_walk_pe(
-            graph, k=self.pe_embed_k, eweight_name="e_ind"
+            graph.edge_index,
+            num_nodes=graph.num_nodes,
+            k=self.pe_embed_k,
+            edge_weight=graph.edge_type.float() if hasattr(graph, 'edge_type') and graph.edge_type is not None else None,
         )
-        graph.ndata["h"] = torch.cat((graph.ndata["h"], pe_embeds), -1).float()
+        graph.x = torch.cat((graph.x, pe_embeds), -1).float()
         return graph
 
     def process_tree_gen(self, tree: dict, convert_to_dgl=True):
@@ -403,11 +406,14 @@ class TreeProcessor:
             h_adds_vec = torch.from_numpy(h_adds)
             node_data = torch.hstack([node_data, h_featurizer[h_adds_vec]])
 
-        g = dgl.graph(data=(src_tens, dest_tens), num_nodes=num_nodes)
-        g.ndata["h"] = node_data.float()
-        g.edata["e"] = bond_types_onehot.float()
-        g.edata["e_ind"] = bond_types.long()
-        return g
+        edge_index = torch.stack([src_tens, dest_tens], dim=0)  # (2, E)
+        data = Data(
+            x=node_data.float(),
+            edge_index=edge_index,
+            edge_attr=bond_types_onehot.float(),
+            edge_type=bond_types.long(),
+        )
+        return data
 
     def get_node_feats(self):
         if self.embed_elem_group:
@@ -575,14 +581,14 @@ class GenDataset(DAGDataset):
         frag_graphs_e = [j for i in frag_graphs for j in i]
 
         num_frags = torch.LongTensor([len(i) for i in frag_graphs])
-        frag_atoms = torch.LongTensor([j.num_nodes() for i in frag_graphs for j in i])
+        frag_atoms = torch.LongTensor([j.num_nodes for i in frag_graphs for j in i])
 
         targs = [j for i in input_list for j in i["targs"]]
         targs_padded = torch.nn.utils.rnn.pad_sequence(targs, batch_first=True)
 
         batched_reprs = _collate_root(input_list)
 
-        frag_batch = dgl.batch(frag_graphs_e)
+        frag_batch = Batch.from_data_list(frag_graphs_e)
         root_inds = torch.arange(len(frag_graphs)).repeat_interleave(num_frags)
 
         max_broken = [torch.LongTensor(i["max_broken"]) for i in input_list]
@@ -679,10 +685,10 @@ class IntenDataset(DAGDataset):
         frag_graphs = [j["dgl_frags"] for j in input_list]
         frag_graphs_e = [j for i in frag_graphs for j in i]
         num_frags = torch.LongTensor([len(i) for i in frag_graphs])
-        frag_atoms = torch.LongTensor([i.num_nodes() for i in frag_graphs_e])
+        frag_atoms = torch.LongTensor([i.num_nodes for i in frag_graphs_e])
         batched_reprs = _collate_root(input_list)
 
-        frag_batch = dgl.batch(frag_graphs_e)
+        frag_batch = Batch.from_data_list(frag_graphs_e)
         root_inds = torch.arange(len(frag_graphs)).repeat_interleave(num_frags)
 
         targs_padded = None
@@ -926,8 +932,8 @@ def _unroll_pad(input_list, key):
 
 def _collate_root(input_list):
     root_reprs = [j["root_repr"] for j in input_list]
-    if isinstance(root_reprs[0], dgl.DGLGraph):
-        batched_reprs = dgl.batch(root_reprs)
+    if isinstance(root_reprs[0], Data):
+        batched_reprs = Batch.from_data_list(root_reprs)
     elif isinstance(root_reprs[0], np.ndarray):
         batched_reprs = torch.FloatTensor(np.vstack(root_reprs)).float()
     else:

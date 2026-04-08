@@ -4,7 +4,7 @@ import pytorch_lightning as pl
 import numpy as np
 
 import torch.nn as nn
-import dgl.nn as dgl_nn
+from torch_geometric.nn import global_mean_pool, GlobalAttention
 
 import torch_scatter as ts
 import ms_pred.nn_utils as nn_utils
@@ -143,9 +143,9 @@ class GraffGNN(pl.LightningModule):
             dropout=dropout,
         )
         if self.pool_op == "avg":
-            self.pool = dgl_nn.AvgPooling()
+            self.pool = lambda x, batch: global_mean_pool(x, batch)
         elif self.pool_op == "attn":
-            self.pool = dgl_nn.GlobalAttentionPooling(nn.Linear(hidden_size, 1))
+            self.pool = GlobalAttention(nn.Linear(hidden_size, 1))
         else:
             raise NotImplementedError()
 
@@ -235,23 +235,21 @@ class GraffGNN(pl.LightningModule):
     def forward(self, graphs, full_forms, adducts, nces):
         """predict spec"""
 
+        original_x = graphs.x
+        ndata = graphs.x
         if self.embed_adduct:
             embed_adducts = self.adduct_embedder[adducts.long()]
-            ndata = graphs.ndata["h"]
-            embed_adducts_expand = embed_adducts.repeat_interleave(
-                graphs.batch_num_nodes(), 0
-            )
+            embed_adducts_expand = embed_adducts[graphs.batch]
             ndata = torch.cat([ndata, embed_adducts_expand], -1)
-            graphs.ndata["h"] = ndata
 
         if self.embed_collision_energy:
-            ndata = graphs.ndata["h"]
-            ndata = torch.cat([ndata, nces.repeat_interleave(graphs.batch_num_nodes(), 0).unsqueeze(-1)], -1)
-            graphs.ndata["h"] = ndata
+            ndata = torch.cat([ndata, nces[graphs.batch].unsqueeze(-1)], -1)
 
+        graphs.x = ndata
         output = self.gnn(graphs)
-        hidden = self.pool(graphs, output)
-        batch_size = output.shape[0]
+        hidden = self.pool(output, graphs.batch)
+        graphs.x = original_x
+        batch_size = hidden.shape[0]
 
         # Predict intens at all formulae
         # output = torch.sigmoid(self.output_layer(output))

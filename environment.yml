@@ -1,7 +1,6 @@
 name: ms-gen
 channels:
 - pytorch
-- dglteam
 - conda-forge
 - pyg
 - bioconda
@@ -24,5 +23,4 @@ dependencies:
 - pytorch-scatter
 - pytorch-sparse
 - pyg
-- dgl-cuda11.1=0.8.2
 - MKL=2024.0.0

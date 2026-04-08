@@ -11,7 +11,7 @@ from rdkit import Chem
 
 import torch
 from torch.utils.data.dataset import Dataset
-import dgl
+from torch_geometric.data import Data, Batch
 
 import ms_pred.common as common
 import ms_pred.massformer_pred._massformer_graph_featurizer as mformer
@@ -253,8 +253,8 @@ class IntenDataset(Dataset):
         form_strs = [j["form_strs"] for j in input_list]
         adducts = [j["adduct"] for j in input_list]
 
-        if isinstance(mol_graphs[0], dgl.DGLGraph):
-            batched_graph = dgl.batch(mol_graphs)
+        if isinstance(mol_graphs[0], Data):
+            batched_graph = Batch.from_data_list(mol_graphs)
         elif isinstance(mol_graphs[0], np.ndarray):
             batched_graph = torch.FloatTensor(np.vstack(mol_graphs))
         elif isinstance(mol_graphs[0], pyg_data):
@@ -558,8 +558,8 @@ class ScarfDataset(Dataset):
         adducts = [j["adduct"] for j in input_list]
         adducts = torch.FloatTensor(adducts)
 
-        if isinstance(mol_graphs[0], dgl.DGLGraph):
-            batched_graph = dgl.batch(mol_graphs)
+        if isinstance(mol_graphs[0], Data):
+            batched_graph = Batch.from_data_list(mol_graphs)
         elif isinstance(mol_graphs[0], np.ndarray):
             batched_graph = torch.FloatTensor(np.vstack(mol_graphs))
         elif isinstance(mol_graphs[0], pyg_data):
@@ -745,8 +745,8 @@ class MolDataset(Dataset):
 
         adducts = torch.FloatTensor(adducts)
 
-        if isinstance(mol_graphs[0], dgl.DGLGraph):
-            batched_graph = dgl.batch(mol_graphs)
+        if isinstance(mol_graphs[0], Data):
+            batched_graph = Batch.from_data_list(mol_graphs)
         elif isinstance(mol_graphs[0], np.ndarray):
             batched_graph = torch.FloatTensor(np.vstack(mol_graphs))
         else:

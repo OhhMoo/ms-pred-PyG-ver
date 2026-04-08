@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from rdkit import Chem
 from torch.utils.data.dataset import Dataset
-import dgl
+from torch_geometric.data import Batch
 
 import ms_pred.common as common
 
@@ -149,7 +149,7 @@ class BinnedDataset(Dataset):
         spectra_tensors = torch.stack([torch.tensor(spectra) for spectra in spec_ars])
         full_weight = torch.FloatTensor(full_weight)
 
-        batched_graph = dgl.batch(graphs)
+        batched_graph = Batch.from_data_list(graphs)
         # frag_batch.set_n_initializer(dgl.init.zero_initializer)
         # frag_batch.set_e_initializer(dgl.init.zero_initializer)
 
@@ -251,7 +251,7 @@ class MolDataset(Dataset):
         adducts = [j["adduct"] for j in input_list]
         adducts = torch.FloatTensor(adducts)
 
-        batched_graph = dgl.batch(graphs)
+        batched_graph = Batch.from_data_list(graphs)
         full_weight = torch.FloatTensor(full_weight)
         return_dict = {
             "graphs": batched_graph,

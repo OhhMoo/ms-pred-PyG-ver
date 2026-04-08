@@ -5,11 +5,10 @@ import torch
 import pytorch_lightning as pl
 import torch.nn as nn
 import torch_scatter as ts
-import dgl.nn as dgl_nn
+from torch_geometric.nn import global_mean_pool, GlobalAttention
 import pygmtools as pygm
 import math
 import functools
-import dgl
 from torch.nn.functional import pad
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
 
@@ -20,7 +19,7 @@ import ms_pred.magma.fragmentation as fragmentation
 import ms_pred.magma.run_magma as run_magma
 from rdkit import Chem
 from rdkit.Chem import Draw
-import ms_pred.nn_utils.dgl_modules as dgl_mods
+import ms_pred.nn_utils.pyg_modules as pyg_mods
 from ms_pred.nn_utils import GGNN
 import matplotlib.pyplot as plt
 pygm.BACKEND = "pytorch"
@@ -249,7 +248,7 @@ class IntenGNN(pl.LightningModule):
             )
 
         if self.matching_method == "sinkhorn" or self.matching_method == "softmax":
-            self.hyper_gnn = dgl_mods.HyperGNN(self.hidden_size, self.hidden_size, num_conv=3)
+            self.hyper_gnn = pyg_mods.HyperGNN(self.hidden_size, self.hidden_size, num_conv=3)
             self.hyper_gnn_reverse = copy.deepcopy(self.hyper_gnn)
 
         self.ppm_tol = ppm_tol
@@ -318,9 +317,9 @@ class IntenGNN(pl.LightningModule):
         self.inten_buckets.requires_grad = False
 
         if self.pool_op == "avg":
-            self.pool = dgl_nn.AvgPooling()
+            self.pool = lambda x, batch: global_mean_pool(x, batch)
         elif self.pool_op == "attn":
-            self.pool = dgl_nn.GlobalAttentionPooling(nn.Linear(hidden_size, 1))
+            self.pool = GlobalAttention(nn.Linear(hidden_size, 1))
         else:
             raise NotImplementedError()
 
@@ -1050,39 +1049,30 @@ class IntenGNN(pl.LightningModule):
         if self.root_encode == "fp":
             raise NotImplementedError()
         elif self.root_encode == "gnn":
-            with root_repr.local_scope():
-                if self.embed_adduct:
-                    embed_adducts_expand = embed_adducts.repeat_interleave(
-                        root_repr.batch_num_nodes(), 0
-                    )
-                    ndata = root_repr.ndata["h"]
-                    ndata = torch.cat([ndata, embed_adducts_expand], -1)
-                    root_repr.ndata["h"] = ndata
-                if self.embed_collision:
-                    embed_collision = torch.cat(
-                        (torch.sin(collision_engs.unsqueeze(1) / self.collision_embedder_denominators.unsqueeze(0)),
-                         torch.cos(collision_engs.unsqueeze(1) / self.collision_embedder_denominators.unsqueeze(0))),
-                        dim=1
-                    )
-                    embed_collision = torch.where(  # handle entries without collision energy (== nan)
-                        torch.isnan(embed_collision), self.collision_embed_merged.unsqueeze(0), embed_collision
-                    )
-                    embed_collision_expand = embed_collision.repeat_interleave(
-                        root_repr.batch_num_nodes(), 0
-                    )
-                    ndata = root_repr.ndata["h"]
-                    ndata = torch.cat([ndata, embed_collision_expand], -1)
-                    root_repr.ndata["h"] = ndata
-                if self.embed_instrument:
-                    embed_instruments_expand = embed_instruments.repeat_interleave(
-                        root_repr.batch_num_nodes(), 0
-                    )
+            original_x = root_repr.x
+            ndata = root_repr.x
+            if self.embed_adduct:
+                embed_adducts_expand = embed_adducts[root_repr.batch]
+                ndata = torch.cat([ndata, embed_adducts_expand], -1)
+            if self.embed_collision:
+                embed_collision = torch.cat(
+                    (torch.sin(collision_engs.unsqueeze(1) / self.collision_embedder_denominators.unsqueeze(0)),
+                     torch.cos(collision_engs.unsqueeze(1) / self.collision_embedder_denominators.unsqueeze(0))),
+                    dim=1
+                )
+                embed_collision = torch.where(  # handle entries without collision energy (== nan)
+                    torch.isnan(embed_collision), self.collision_embed_merged.unsqueeze(0), embed_collision
+                )
+                embed_collision_expand = embed_collision[root_repr.batch]
+                ndata = torch.cat([ndata, embed_collision_expand], -1)
+            if self.embed_instrument:
+                embed_instruments_expand = embed_instruments[root_repr.batch]
+                ndata = torch.cat([ndata, embed_instruments_expand], -1)
 
-                    ndata = root_repr.ndata["h"]
-                    ndata = torch.cat([ndata, embed_instruments_expand], -1)
-                    root_repr.ndata["h"] = ndata
-                root_embeddings = root_module(root_repr)
-                root_embeddings = self.pool(root_repr, root_embeddings)
+            root_repr.x = ndata
+            root_embeddings = root_module(root_repr)
+            root_embeddings = self.pool(root_embeddings, root_repr.batch)
+            root_repr.x = original_x
         else:
             pass
         if self.add_ref and self.matching_method == "none" and ref_root is None:
@@ -1093,9 +1083,9 @@ class IntenGNN(pl.LightningModule):
         ext_root = root_embeddings[ind_maps]
         # Extend the root further to cover each individual atom
         ext_root_atoms = torch.repeat_interleave(
-            ext_root, graphs.batch_num_nodes(), dim=0
+            ext_root, torch.bincount(graphs.batch), dim=0
         )
-        concat_list = [graphs.ndata["h"]]
+        concat_list = [graphs.x]
 
         if self.inject_early:
             concat_list.append(ext_root_atoms)
@@ -1103,31 +1093,32 @@ class IntenGNN(pl.LightningModule):
         if self.embed_adduct:
             adducts_mapped = embed_adducts[ind_maps]
             adducts_exp = torch.repeat_interleave(
-                adducts_mapped, graphs.batch_num_nodes(), dim=0
+                adducts_mapped, torch.bincount(graphs.batch), dim=0
             )
             concat_list.append(adducts_exp)
 
         if self.embed_collision:
             collision_mapped = embed_collision[ind_maps]
             collision_exp = torch.repeat_interleave(
-                collision_mapped, graphs.batch_num_nodes(), dim=0
+                collision_mapped, torch.bincount(graphs.batch), dim=0
             )
             concat_list.append(collision_exp)
         
         if self.embed_instrument:
             instruments_mapped = embed_instruments[ind_maps]
             instruments_exp = torch.repeat_interleave(
-                instruments_mapped, graphs.batch_num_nodes(), dim=0
+                instruments_mapped, torch.bincount(graphs.batch), dim=0
             )
             concat_list.append(instruments_exp)
 
-        with graphs.local_scope():
-            graphs.ndata["h"] = torch.cat(concat_list, -1).float()
+        original_gx = graphs.x
+        graphs.x = torch.cat(concat_list, -1).float()
 
-            frag_embeddings = gnn(graphs)
+        frag_embeddings = gnn(graphs)
 
-            # Average embed the full root molecules and fragments
-            avg_frags = self.pool(graphs, frag_embeddings)
+        # Average embed the full root molecules and fragments
+        avg_frags = self.pool(frag_embeddings, graphs.batch)
+        graphs.x = original_gx
 
         # expand broken and map it to each fragment
         broken_arange = torch.arange(broken.shape[-1]).to(device)
@@ -1285,7 +1276,10 @@ class IntenGNN(pl.LightningModule):
     def dag_message_passing(self, hidden, num_frags, hyper_graph):
         hidden = nn_utils.pack_padded_tensor(hidden, num_frags)
         hidden_forward = self.hyper_gnn(hyper_graph, hidden)
-        reverse_hyper_graph = dgl.reverse(hyper_graph)
+        from torch_geometric.data import Data as _Data
+        reverse_hyper_graph = _Data(edge_index=hyper_graph.edge_index.flip(0), num_nodes=hyper_graph.num_nodes)
+        if hasattr(hyper_graph, 'batch'):
+            reverse_hyper_graph.batch = hyper_graph.batch
         hidden_reverse = self.hyper_gnn_reverse(reverse_hyper_graph, hidden)
         hidden = hidden + hidden_forward + hidden_reverse
         padded_hidden = nn_utils.pad_packed_tensor(hidden, num_frags, 0)

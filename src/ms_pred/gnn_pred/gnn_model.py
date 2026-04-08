@@ -4,7 +4,7 @@ import pytorch_lightning as pl
 import numpy as np
 
 import torch.nn as nn
-import dgl.nn as dgl_nn
+from torch_geometric.nn import global_mean_pool, GlobalAttention
 
 import ms_pred.nn_utils as nn_utils
 import ms_pred.common as common
@@ -121,9 +121,9 @@ class ForwardGNN(pl.LightningModule):
             dropout=dropout,
         )
         if self.pool_op == "avg":
-            self.pool = dgl_nn.AvgPooling()
+            self.pool = lambda x, batch: global_mean_pool(x, batch)
         elif self.pool_op == "attn":
-            self.pool = dgl_nn.GlobalAttentionPooling(nn.Linear(hidden_size, 1))
+            self.pool = GlobalAttention(nn.Linear(hidden_size, 1))
         else:
             raise NotImplementedError()
 
@@ -175,15 +175,11 @@ class ForwardGNN(pl.LightningModule):
 
         if self.embed_adduct:
             embed_adducts = self.adduct_embedder[adducts.long()]
-            ndata = graphs.ndata["h"]
-            embed_adducts_expand = embed_adducts.repeat_interleave(
-                graphs.batch_num_nodes(), 0
-            )
-            ndata = torch.cat([ndata, embed_adducts_expand], -1)
-            graphs.ndata["h"] = ndata
+            embed_adducts_expand = embed_adducts[graphs.batch]
+            graphs.x = torch.cat([graphs.x, embed_adducts_expand], -1)
 
         output = self.gnn(graphs)
-        output = self.pool(graphs, output)
+        output = self.pool(output, graphs.batch)
         batch_size = output.shape[0]
 
         # Convert full weight into bin index
