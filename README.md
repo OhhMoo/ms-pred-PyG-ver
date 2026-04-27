@@ -1,4 +1,5 @@
 #  Mass Spectrum Predictor
+This is a specific version of ms-pred with PyG library implementation
 
 **Update 10/25/2025:** We are releasing _open-source_ weights of ICEBERG trained on the [MassSpecGym](https://arxiv.org/abs/2410.23326) benchmark. ICEBERG achieves 57.8% cosine similarity and 46% top-1 retrieval accuracy when retrieving from formula candidates, representing state-of-the-art performance on the forward spectrum simulation challenge. The codebase has been updated to support training and inference from MassSpecGym data, and the retrieval sets used for this task as well as weights are available via Dropbox [here](https://www.dropbox.com/scl/fo/d73o0o4u5ymr9ubtp3m7j/AL4r7e3p9ElV0ewBwDCScbM?rlkey=tr99zkzy208ol8aw0pfsdsf5v&st=2zg9n01y&dl=0). Given the challenge of the scaffold split and inclusion of only [M+H]+ adducts and positive mode spectra, we encourage users to adopt the ICEBERG version trained on the NIST20 commercial dataset when possible.   
 
